@@ -1,0 +1,14 @@
+matplotlib
+numpy<2.0.0
+onnxruntime==1.18.0
+onnxruntime-gpu==1.18.0; platform_system != "Darwin" and platform_machine not in "aarch64, arm64"
+opencv-python>=4.0.0
+pyinstaller==6.9.0
+scikit-learn
+toga
+desktop-notifier
+tqdm
+platformdirs
+timm
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch

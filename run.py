@@ -104,9 +104,9 @@ def run(config: Config, gui=False):
     else:
         megadetector = MegaDetector()
     yield
-    if config.detection_sampling_method == DetectionSamplingMethod.SAM:
-        sam = SAM()
-        yield
+    # Always initialize SAM for calibration frame human masking
+    sam = SAM()
+    yield
 
     with open(os.path.join(config.data_dir, "results", "results.csv"), "w", newline="") as result_csv_file, open(os.path.join(config.data_dir, "results", "results.txt"), "w") as result_distance_file: 
         head_row_csv = ["transect_id", "frame_id", "detection_idx", "detection_confidence", "depth", "world_x", "world_y", "world_z", "error_status"]
@@ -128,6 +128,55 @@ def run(config: Config, gui=False):
                 farthest_calibration_frame_disp = None  # inverse depth map
                 farthest_calibration_frame_disp_raw = None  # raw model output (aligned target)
                 calibration_map = None
+
+                # Preprocess calibration frames: detect humans and create masks, or move to no_human
+                calibration_dir = os.path.join(transect_dir, "calibration_frames")
+                if os.path.isdir(calibration_dir):
+                    calibration_frame_filenames = sorted(multi_file_extension_glob(
+                        os.path.join(calibration_dir, "*"), 
+                        config.intensity_image_extensions
+                    ))
+                    if calibration_frame_filenames:
+                        masks_dir = os.path.join(transect_dir, "calibration_frames_masks")
+                        os.makedirs(masks_dir, exist_ok=True)
+                        no_human_dir = os.path.join(transect_dir, "no_human")
+                        
+                        for img_path in calibration_frame_filenames:
+                            img = imread(img_path)
+                            if img is None:
+                                continue
+                            
+                            # Detect humans using Megadetector
+                            scores, labels, boxes = megadetector(img)
+                            human_indices = np.nonzero((labels.flatten() == MegaDetectorLabel.PERSON) & (scores.flatten() >= config.bbox_confidence_threshold))[0]
+                            
+                            if len(human_indices) > 0:
+                                human_boxes = boxes[human_indices]
+                                # Clip box coords to image dimensions to prevent out of bounds
+                                for box in human_boxes:
+                                    box[0] = max(0.0, min(float(img.shape[1] - 1), float(box[0])))
+                                    box[1] = max(0.0, min(float(img.shape[0] - 1), float(box[1])))
+                                    box[2] = max(0.0, min(float(img.shape[1] - 1), float(box[2])))
+                                    box[3] = max(0.0, min(float(img.shape[0] - 1), float(box[3])))
+                                    
+                                masks = sam(img, human_boxes)
+                                
+                                combined_mask = np.zeros(img.shape[0:2], dtype=np.uint8)
+                                for mask in masks:
+                                    combined_mask[mask] = 255
+                                    
+                                mask_filename = os.path.basename(img_path)
+                                mask_path = os.path.join(masks_dir, mask_filename)
+                                cv2.imwrite(mask_path, combined_mask)
+                                logging.info(f"Saved human mask for {mask_filename} to {mask_path}")
+                            else:
+                                os.makedirs(no_human_dir, exist_ok=True)
+                                dest_path = os.path.join(no_human_dir, os.path.basename(img_path))
+                                if os.path.exists(dest_path):
+                                    os.remove(dest_path)
+                                os.rename(img_path, dest_path)
+                                logging.info(f"No human detected in {os.path.basename(img_path)}. Moved to {no_human_dir}")
+                            yield
 
                 if config.depth_estimation_model != DepthEstimationModel.DEPTH_AHYTHING_METRIC:
                     calibration_frame_filenames = (

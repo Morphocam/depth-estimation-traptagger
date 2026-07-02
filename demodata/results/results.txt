@@ -1,0 +1,7 @@
+Camera trap*Label	Observation*Radial distance
+T09_demo	4.2132
+T09_demo	5.2586
+T09_demo	4.4883
+T09_demo	4.3523
+T09_demo	4.5276
+T09_demo	6.6431

@@ -33,10 +33,11 @@ def random_seed_manager(seed=random_seed):
 
 def multi_file_extension_glob(base: str, extensions: str, recursive=False):
     """Performs glob matching with multiple filename extensions"""
-    matches = []
+    matches = set()
     for extension in extensions:
-        matches.extend(glob.glob(base + extension, recursive=recursive))
-    return sorted(matches)
+        matches.update(glob.glob(base + extension, recursive=recursive))
+    return sorted(list(matches))
+
 
 
 def get_extension_agnostic_path(base, extensions):

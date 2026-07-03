@@ -132,16 +132,16 @@ def run(config: Config, gui=False):
                 # Preprocess calibration frames: detect humans and create masks, or move to no_human
                 calibration_dir = os.path.join(transect_dir, "calibration_frames")
                 if os.path.isdir(calibration_dir):
-                    calibration_frame_filenames = sorted(multi_file_extension_glob(
+                    calibration_frame_filenames = sorted(list(set(multi_file_extension_glob(
                         os.path.join(calibration_dir, "*"), 
                         config.intensity_image_extensions
-                    ))
+                    ))))
                     if calibration_frame_filenames:
                         masks_dir = os.path.join(transect_dir, "calibration_frames_masks")
                         os.makedirs(masks_dir, exist_ok=True)
                         no_human_dir = os.path.join(transect_dir, "no_human")
                         
-                        for img_path in calibration_frame_filenames:
+                        for img_path in list(calibration_frame_filenames):
                             img = imread(img_path)
                             if img is None:
                                 continue
@@ -176,13 +176,17 @@ def run(config: Config, gui=False):
                                     os.remove(dest_path)
                                 os.rename(img_path, dest_path)
                                 logging.info(f"No human detected in {os.path.basename(img_path)}. Moved to {no_human_dir}")
+                                if img_path in calibration_frame_filenames:
+                                    calibration_frame_filenames.remove(img_path)
+                                yield
+                                continue
                             yield
 
                 if config.depth_estimation_model != DepthEstimationModel.DEPTH_AHYTHING_METRIC:
-                    calibration_frame_filenames = (
+                    calibration_frame_filenames = sorted(list(set(
                         multi_file_extension_glob(os.path.join(transect_dir, "calibration_frames", "*"), config.intensity_image_extensions) +
                         multi_file_extension_glob(os.path.join(transect_dir, "calibration_frames_cropped", "*"), config.intensity_image_extensions)  # for backwards compability. use crop configuration instead
-                    )
+                    )))
 
                     if calibration_frame_filenames:
                         calibration_dataset = ImageDataset(calibration_frame_filenames, config.crop_top, config.crop_bottom, config.crop_left, config.crop_right)
@@ -352,7 +356,7 @@ def run(config: Config, gui=False):
                             for i in range(len(imgs)):
                                 detection_id = os.path.splitext(os.path.basename(image_paths[i]))[0]
                                 precomputed_depth_filename = get_extension_agnostic_path(os.path.join(transect_dir, "detection_frames_depth", detection_id), config.depth_image_extensions)
-                                if precomputed_depth_filename is None and farthest_calibration_frame_disp is None:
+                                if (precomputed_depth_filename is None and farthest_calibration_frame_disp is None) or (config.sample_from == SampleFrom.REFERENCE and farthest_calibration_frame_disp is None):
                                     logging.warn(f"Unable to perform distance estimation on detection '{detection_id}' due to failed calibration and no precomputed depth maps.")
                                     disps.append(None)
                                     continue
@@ -363,9 +367,9 @@ def run(config: Config, gui=False):
                                     disps.append(disp)
                                 else:
                                     disps.append(None) # Placeholder, will be computed in batch
-
+ 
                             # Compute depth for images that need it
-                            imgs_to_process_indices = [i for i, disp in enumerate(disps) if disp is None]
+                            imgs_to_process_indices = [i for i, disp in enumerate(disps) if disp is None and farthest_calibration_frame_disp is not None]
                             if imgs_to_process_indices:
                                 imgs_to_process = [imgs[i] for i in imgs_to_process_indices]
                                 if imgs_to_process:

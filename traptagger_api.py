@@ -840,18 +840,22 @@ def run_transect_job(
     {str(detection_id): {"distance": float|None, "error": str|None}}
     When collect_bbox_audit is True, also includes key 'bbox_audit' (dict).
   '''
-  session = prepare_transect_session(
-    data_dir,
-    transect_id,
-    config=config,
-    collect_bbox_audit=collect_bbox_audit,
-    cached_calib_path=cached_calib_path,
-    calib_cache_path=calib_cache_path,
-  )
-  results = estimate_transect_traps(session)
-  if collect_bbox_audit:
-    return {'results': results, 'bbox_audit': session.get('bbox_audit')}
-  return results
+  session = None
+  try:
+    session = prepare_transect_session(
+      data_dir,
+      transect_id,
+      config=config,
+      collect_bbox_audit=collect_bbox_audit,
+      cached_calib_path=cached_calib_path,
+      calib_cache_path=calib_cache_path,
+    )
+    results = estimate_transect_traps(session)
+    if collect_bbox_audit:
+      return {'results': results, 'bbox_audit': session.get('bbox_audit')}
+    return results
+  finally:
+    release_transect_session(session)
 
 
 def prepare_transect_session(
@@ -947,3 +951,31 @@ def estimate_transect_traps(session: dict) -> dict:
     session['calib'],
     bbox_audit=session.get('bbox_audit'),
   )
+
+
+def release_transect_session(session: Optional[dict]) -> None:
+  '''
+  Unload ONNX/torch models from a transect session and free GPU memory.
+
+  Call from a finally block after each Celery depth job so VRAM does not
+  accumulate across tasks on a long-lived worker process.
+  '''
+  if not session:
+    return
+
+  from utils import free_gpu_memory
+
+  for key in ('depth_estimation_model', 'sam'):
+    model = session.pop(key, None)
+    if model is None:
+      continue
+    try:
+      if hasattr(model, 'close'):
+        model.close()
+    except Exception as e:
+      logging.warning('Failed to close depth model %s: %s', key, e)
+    del model
+
+  session.pop('calib', None)
+  session.clear()
+  free_gpu_memory()

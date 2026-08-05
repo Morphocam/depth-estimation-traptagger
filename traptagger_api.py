@@ -840,6 +840,35 @@ def run_transect_job(
     {str(detection_id): {"distance": float|None, "error": str|None}}
     When collect_bbox_audit is True, also includes key 'bbox_audit' (dict).
   '''
+  session = prepare_transect_session(
+    data_dir,
+    transect_id,
+    config=config,
+    collect_bbox_audit=collect_bbox_audit,
+    cached_calib_path=cached_calib_path,
+    calib_cache_path=calib_cache_path,
+  )
+  results = estimate_transect_traps(session)
+  if collect_bbox_audit:
+    return {'results': results, 'bbox_audit': session.get('bbox_audit')}
+  return results
+
+
+def prepare_transect_session(
+  data_dir: str,
+  transect_id: str,
+  config: Optional[Config] = None,
+  collect_bbox_audit: bool = False,
+  cached_calib_path: Optional[str] = None,
+  calib_cache_path: Optional[str] = None,
+) -> dict:
+  '''
+  Initialize models and calibration once for a transect job.
+
+  Returns a session dict that estimate_transect_traps() can reuse across
+  trap download chunks (caller rewrites detection_frames/ + manifest.json
+  between calls).
+  '''
   config = config or traptagger_default_config()
   config.data_dir = data_dir
   os.makedirs(os.path.join(data_dir, 'results'), exist_ok=True)
@@ -886,16 +915,35 @@ def run_transect_job(
     )
     bbox_audit['job_config']['resize_shape'] = resize_shape
 
-  results = _estimate_trap_detections(
+  return {
+    'data_dir': data_dir,
+    'transect_id': transect_id,
+    'transect_dir': transect_dir,
+    'config': config,
+    'depth_estimation_model': depth_estimation_model,
+    'sam': sam,
+    'calib': calib,
+    'bbox_audit': bbox_audit,
+    'collect_bbox_audit': collect_bbox_audit,
+  }
+
+
+def estimate_transect_traps(session: dict) -> dict:
+  '''
+  Estimate distances for trap detections currently listed in the transect
+  manifest. Intended to be called repeatedly after swapping detection_frames/.
+
+  Returns:
+    {str(detection_id): {"distance": float|None, "error": str|None}}
+  '''
+  transect_dir = session['transect_dir']
+  manifest = _load_manifest(transect_dir)
+  return _estimate_trap_detections(
     transect_dir,
     manifest,
-    config,
-    depth_estimation_model,
-    sam,
-    calib,
-    bbox_audit=bbox_audit,
+    session['config'],
+    session['depth_estimation_model'],
+    session['sam'],
+    session['calib'],
+    bbox_audit=session.get('bbox_audit'),
   )
-
-  if bbox_audit is not None:
-    return {'results': results, 'bbox_audit': bbox_audit}
-  return results

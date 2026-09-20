@@ -536,6 +536,50 @@ class DownloadableWeights:
                 os.unlink(filepath)
             raise RuntimeError(f"Failed retrieving weight '{filename}'. Please try again. Full exception: {e}")
 
+    def close(self):
+        """
+        Drop ONNX Runtime / torch model handles so CUDA VRAM can be reclaimed
+        between jobs. Subclasses may override for extra cleanup.
+        """
+        for attr in (
+            "session",
+            "encoder_session",
+            "decoder_session",
+            "model",
+            "encoder",
+            "decoder",
+        ):
+            if not hasattr(self, attr):
+                continue
+            obj = getattr(self, attr)
+            try:
+                delattr(self, attr)
+            except Exception:
+                pass
+            # Move torch modules off GPU before dropping the last reference.
+            if obj is not None and hasattr(obj, "cpu") and callable(obj.cpu):
+                try:
+                    obj.cpu()
+                except Exception:
+                    pass
+            del obj
+        self._model_loaded = False
+
+
+def free_gpu_memory():
+    """Force Python GC and empty the torch CUDA cache if available."""
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
 
 def blur_and_downsample(img, calibration_downsampling_factor=1/8, calibration_blur_sigma=41):
     mask = img.mask if (hasattr(img, "mask") and img.mask.shape != ()) else None

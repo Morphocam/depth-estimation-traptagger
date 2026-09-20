@@ -14,7 +14,7 @@ import numpy as np
 from sklearn import linear_model
 import scipy.ndimage as ndimage
 from platformdirs import PlatformDirs
-from custom_types import RegressionMethod
+from custom_types import RegressionMethod, MetricCalibrationMethod
 
 
 dirs = PlatformDirs("depth-estimation-traptagger", "timmh")
@@ -252,6 +252,82 @@ def piecewise_linear_calibration(x, y, eps=1e-6):
         return np.clip(out, eps, np.inf)
 
     return f
+
+
+def calibrate_metric_model(pred_depths, true_depths, method, exp=1, eps=1e-6):
+    """
+    Create a correction function for models which already predict metric depth.
+
+    Counterpart of `calibrate`/`piecewise_linear_calibration`, which recover the
+    unknown global scale and shift of a *relative* depth model. A metric model
+    already produces a single, image-independent depth scale, so no per-image
+    alignment is needed here: a metric model only needs one correction per
+    transect, fitted once on the calibration frames and reused for every
+    detection frame.
+
+    `pred_depths` are the predicted metric depths at the calibration subject
+    (one per calibration frame), `true_depths` the corresponding measured
+    distances in meters. As in the relative pipeline, the fit is performed in
+    `disparity ** exp` space, i.e. in inverse depth for `exp == 1` and in metric
+    depth for `exp == -1`.
+
+    Returns a callable mapping a predicted metric depth map to a corrected
+    metric depth map.
+    """
+    pred = np.asarray(pred_depths, dtype=np.float64).reshape(-1)
+    true = np.asarray(true_depths, dtype=np.float64).reshape(-1)
+    assert len(pred) == len(true), f"inconsistent sample length in metric calibration: len(pred)={len(pred)}, len(true)={len(true)}"
+
+    valid = np.isfinite(pred) & np.isfinite(true) & (pred > eps) & (true > eps)
+    pred, true = pred[valid], true[valid]
+    if len(pred) == 0:
+        raise ValueError("no usable calibration points for metric calibration")
+
+    if method == MetricCalibrationMethod.NONE:
+        return lambda depth: np.asarray(depth, dtype=np.float64)
+
+    def scale_only():
+        # robust against outlying calibration frames, and the only fit which
+        # remains well defined when a single calibration frame is available
+        s = float(np.median(true / pred))
+        if not np.isfinite(s) or s <= 0:
+            raise ValueError(f"invalid scale '{s}' estimated during metric calibration")
+        return lambda disp, s=s: np.clip(np.asarray(disp, dtype=np.float64) / s, eps, np.inf)
+
+    if method == MetricCalibrationMethod.SCALE or len(pred) < 2:
+        if method != MetricCalibrationMethod.SCALE:
+            print(f"Only {len(pred)} metric calibration point(s) available. Falling back to SCALE.")
+        disparity_map = scale_only()
+    else:
+        x = np.clip(pred, eps, np.inf) ** -1
+        y = np.clip(true, eps, np.inf) ** -1
+
+        if method == MetricCalibrationMethod.AFFINE:
+            base = calibrate(x ** exp, y ** exp, RegressionMethod.LEASTSQUARES)
+            # a valid correction must be strictly increasing, otherwise nearer
+            # subjects would be mapped behind farther ones
+            probe = np.array([np.min(x ** exp), np.max(x ** exp)], dtype=np.float64)
+            probe_out = np.asarray(base(probe), dtype=np.float64)
+            if not np.all(np.isfinite(probe_out)) or probe_out[1] <= probe_out[0]:
+                print("Non-monotonic AFFINE metric calibration. Falling back to SCALE.")
+                disparity_map = scale_only()
+            else:
+                disparity_map = lambda disp, base=base: np.clip(
+                    np.clip(base(np.asarray(disp, dtype=np.float64) ** exp), eps, np.inf) ** exp, eps, np.inf
+                )
+        elif method == MetricCalibrationMethod.PIECEWISE_LINEAR:
+            base = piecewise_linear_calibration(x ** exp, y ** exp, eps=eps)
+            disparity_map = lambda disp, base=base: np.clip(
+                np.clip(base(np.asarray(disp, dtype=np.float64) ** exp), eps, np.inf) ** exp, eps, np.inf
+            )
+        else:
+            raise ValueError(f"Invalid metric calibration method '{method}'")
+
+    def correct(depth):
+        depth = np.clip(np.asarray(depth, dtype=np.float64), eps, np.inf)
+        return np.clip(disparity_map(depth ** -1), eps, np.inf) ** -1
+
+    return correct
 
 
 def calibrate_v0(x, y, method, n=2, poly_deg=5):

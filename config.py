@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from typing import List
-from custom_types import DetectionSamplingMethod, SampleFrom, MultipleAnimalReduction, RegressionMethod, DepthEstimationModel, DetectionModel
+from custom_types import DetectionSamplingMethod, SampleFrom, MultipleAnimalReduction, RegressionMethod, DepthEstimationModel, DetectionModel, MetricCalibrationMethod
 
 
 @dataclass
@@ -44,6 +44,7 @@ class Config:
     calibration_regression_method: RegressionMethod = RegressionMethod.RANSAC  # one of RANSAC|LEASTSQUARES|POLY|RANSAC_POLY
     calibration_mask_animals: bool = False  # whether to mask animals during calibration
     calibrate_blur: bool = False  # whether to blur depth images during calibration
+    metric_calibration_method: MetricCalibrationMethod = MetricCalibrationMethod.NONE  # correction applied to metric depth models (DEPTH_AHYTHING_METRIC|DEPTH_PRO|UNIDEPTH_V2). one of NONE|SCALE|AFFINE|PIECEWISE_LINEAR
 
     # sampling_parameters
     detection_sampling_method: DetectionSamplingMethod = DetectionSamplingMethod.BBOX_PERCENTILE  # one of BBOX_BOTTOM|BBOX_PERCENTILE|SAM

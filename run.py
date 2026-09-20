@@ -17,10 +17,11 @@ from depth_anything import DepthAnything
 from metric3d import Metric3D
 from monodepth2 import MonoDepth2
 from depthpro import DepthPro
+from unidepthv2 import UniDepthv2
 from megadetector import MegaDetector, MegaDetectorV2, MegaDetectorV6, MegaDetectorLabel
 from sam import SAM
-from custom_types import DetectionSamplingMethod, MultipleAnimalReduction, SampleFrom, DepthEstimationModel, DetectionModel
-from utils import calibrate, calibrate_v0, piecewise_linear_calibration, crop, resize, exception_to_str, get_calibration_frame_dist, get_extension_agnostic_path, multi_file_extension_glob, blur_and_downsample, imread
+from custom_types import DetectionSamplingMethod, MultipleAnimalReduction, SampleFrom, DepthEstimationModel, DetectionModel, MetricCalibrationMethod, METRIC_DEPTH_ESTIMATION_MODELS
+from utils import calibrate, calibrate_v0, calibrate_metric_model, piecewise_linear_calibration, crop, resize, exception_to_str, get_calibration_frame_dist, get_extension_agnostic_path, multi_file_extension_glob, blur_and_downsample, imread
 from visualization import visualize_detection, visualize_farthest_calibration_frame
 
 
@@ -94,8 +95,15 @@ def run(config: Config, gui=False):
         depth_estimation_model = MonoDepth2()
     elif config.depth_estimation_model == DepthEstimationModel.DEPTH_PRO:
         depth_estimation_model = DepthPro()
+    elif config.depth_estimation_model == DepthEstimationModel.UNIDEPTH_V2:
+        depth_estimation_model = UniDepthv2()
     else:
         raise ValueError(f"Invalud depth estimation model '{config.depth_estimation_model}'")
+
+    # metric models predict depth in meters directly and are therefore calibrated
+    # by a single per-transect correction instead of the per-image scale/shift
+    # alignment required by relative models
+    uses_metric_model = config.depth_estimation_model in METRIC_DEPTH_ESTIMATION_MODELS
     yield
     if config.detection_model == DetectionModel.MEGADETECTOR_V6:
         megadetector = MegaDetectorV6()
@@ -128,6 +136,7 @@ def run(config: Config, gui=False):
                 farthest_calibration_frame_disp = None  # inverse depth map
                 farthest_calibration_frame_disp_raw = None  # raw model output (aligned target)
                 calibration_map = None
+                metric_calibration_map = None  # metric depth -> corrected metric depth
 
                 # Preprocess calibration frames: detect humans and create masks, or move to no_human
                 calibration_dir = os.path.join(transect_dir, "calibration_frames")
@@ -182,7 +191,7 @@ def run(config: Config, gui=False):
                                 continue
                             yield
 
-                if config.depth_estimation_model != DepthEstimationModel.DEPTH_AHYTHING_METRIC:
+                if not uses_metric_model:
                     calibration_frame_filenames = sorted(list(set(
                         multi_file_extension_glob(os.path.join(transect_dir, "calibration_frames", "*"), config.intensity_image_extensions) +
                         multi_file_extension_glob(os.path.join(transect_dir, "calibration_frames_cropped", "*"), config.intensity_image_extensions)  # for backwards compability. use crop configuration instead
@@ -266,6 +275,94 @@ def run(config: Config, gui=False):
 
                     yield
 
+                elif config.metric_calibration_method != MetricCalibrationMethod.NONE:
+                    # Calibration of a metric depth model. The model already predicts
+                    # depth in meters, so the per-image alignment against the farthest
+                    # calibration frame is unnecessary: a single monotonic correction
+                    # fitted on the calibration frames is applied to every prediction.
+                    calibration_frame_filenames = sorted(list(set(
+                        multi_file_extension_glob(os.path.join(transect_dir, "calibration_frames", "*"), config.intensity_image_extensions) +
+                        multi_file_extension_glob(os.path.join(transect_dir, "calibration_frames_cropped", "*"), config.intensity_image_extensions)  # for backwards compability. use crop configuration instead
+                    )))
+
+                    metric_calibration_points = {}  # true distance -> predicted metric depth
+                    farthest_calibration_frame_depth_raw = None
+                    farthest_calibration_frame_dist = None
+
+                    if calibration_frame_filenames:
+                        calibration_dataset = ImageDataset(calibration_frame_filenames, config.crop_top, config.crop_bottom, config.crop_left, config.crop_right)
+                        calibration_dataloader = DataLoader(calibration_dataset, batch_size=config.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=config.num_workers)
+
+                        for imgs, image_paths in calibration_dataloader:
+                            yield
+
+                            depths = depth_estimation_model(imgs)
+
+                            for i, depth in enumerate(depths):
+                                calibration_frame_filename = image_paths[i]
+                                calibration_frame_id = os.path.splitext(
+                                    os.path.basename(calibration_frame_filename)
+                                )[0]
+                                try:
+                                    dist = get_calibration_frame_dist(transect_dir, calibration_frame_id)
+                                    mask_path = get_extension_agnostic_path(
+                                        os.path.join(
+                                            transect_dir,
+                                            "calibration_frames_masks",
+                                            calibration_frame_id,
+                                        ),
+                                        config.intensity_image_extensions,
+                                    )
+                                    if mask_path is None:
+                                        raise RuntimeError(f"no calibration frame mask found for '{calibration_frame_id}'")
+                                    mask = crop(
+                                        imread(mask_path, cv2.IMREAD_GRAYSCALE) > 127,
+                                        config.crop_top, config.crop_bottom, config.crop_left, config.crop_right,
+                                    )
+                                    mask = resize(mask.astype(np.uint8) * 255, depth.shape) > 127
+                                except Exception as e:
+                                    logging.warn(f"Skipping calibration frame '{calibration_frame_id}' of transect '{transect_id}': {exception_to_str(e)}")
+                                    continue
+
+                                subject_depths = np.asarray(depth)[mask]
+                                subject_depths = subject_depths[np.isfinite(subject_depths) & (subject_depths > eps)]
+                                if subject_depths.size == 0:
+                                    logging.warn(f"Skipping calibration frame '{calibration_frame_id}' of transect '{transect_id}': no valid predicted depth inside the subject mask.")
+                                    continue
+
+                                # the median over the subject mask is the metric counterpart of
+                                # the median disparity sampled in the relative pipeline
+                                metric_calibration_points[dist] = float(np.median(subject_depths))
+
+                                # keep the farthest calibration frame around for visualization
+                                if farthest_calibration_frame_dist is None or dist > farthest_calibration_frame_dist:
+                                    farthest_calibration_frame_dist = dist
+                                    farthest_calibration_frame_depth_raw = np.ma.masked_where(mask, np.asarray(depth, dtype=np.float64))
+
+                    yield
+
+                    try:
+                        metric_calibration_points = OrderedDict(sorted(metric_calibration_points.items(), key=lambda kv: kv[0]))
+                        metric_calibration_map = calibrate_metric_model(
+                            list(metric_calibration_points.values()),
+                            list(metric_calibration_points.keys()),
+                            config.metric_calibration_method,
+                            exp=exp,
+                            eps=eps,
+                        )
+
+                        if farthest_calibration_frame_depth_raw is not None:
+                            farthest_calibration_frame_disp = np.ma.masked_where(
+                                farthest_calibration_frame_depth_raw.mask,
+                                np.clip(metric_calibration_map(farthest_calibration_frame_depth_raw.data), eps, np.inf) ** -1,
+                            )
+                    except Exception as e:
+                        metric_calibration_map = None
+                        farthest_calibration_frame_disp = None
+                        logging.warn(f"Failed metric calibration of transect '{transect_id}' due to exception: {exception_to_str(e)}. Falling back to the uncalibrated metric predictions.")
+
+                    yield
+
                 if config.make_figures and farthest_calibration_frame_disp is not None:
                     visualize_farthest_calibration_frame(config.data_dir, transect_id, farthest_calibration_frame_disp, config.min_depth, config.max_depth)
 
@@ -346,9 +443,11 @@ def run(config: Config, gui=False):
 
 
                         # check if using metric depth model
-                        if config.depth_estimation_model in [DepthEstimationModel.DEPTH_AHYTHING_METRIC, DepthEstimationModel.DEPTH_PRO]:
+                        if uses_metric_model:
                             assert config.sample_from == SampleFrom.DETECTION, "Config must be set to sample from detection if using metric depth model"
                             depths = depth_estimation_model(imgs)
+                            if metric_calibration_map is not None:
+                                depths = [metric_calibration_map(depth) for depth in depths]
                             disps = [np.clip(depth, config.min_depth, config.max_depth) ** -1 for depth in depths]
                         else:
                             # check if depth from stereo camera exists or calibration succeeded

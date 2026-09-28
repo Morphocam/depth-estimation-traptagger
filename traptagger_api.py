@@ -17,14 +17,17 @@ import numpy as np
 
 from config import Config
 from custom_types import (
+    METRIC_DEPTH_ESTIMATION_MODELS,
     DepthEstimationModel,
     DetectionSamplingMethod,
+    MetricCalibrationMethod,
     SampleFrom,
 )
 from sam import SAM
 from utils import (
     blur_and_downsample,
     calibrate,
+    calibrate_metric_model,
     calibrate_v0,
     crop,
     exception_to_str,
@@ -76,6 +79,10 @@ class CalibState:
   ok: bool
   piecewise_x: Optional[np.ndarray] = None
   piecewise_y: Optional[np.ndarray] = None
+  metric_pred_depths: Optional[np.ndarray] = None
+  metric_true_depths: Optional[np.ndarray] = None
+  metric_calibration_method: Optional[MetricCalibrationMethod] = None
+  metric_correct: Optional[Callable] = None
 
 
 def _rebuild_calibration_map(exp, piecewise_x, piecewise_y):
@@ -87,9 +94,23 @@ def _rebuild_calibration_map(exp, piecewise_x, piecewise_y):
   return calibration_map_fn
 
 
+def _has_relative_calibration(calib: CalibState) -> bool:
+  return calib.piecewise_x is not None and calib.piecewise_y is not None and np.size(calib.piecewise_x) > 0
+
+
+def _has_metric_calibration(calib: CalibState) -> bool:
+  return (
+    calib.metric_pred_depths is not None
+    and calib.metric_true_depths is not None
+    and np.size(calib.metric_pred_depths) > 0
+    and calib.metric_calibration_method is not None
+    and calib.metric_calibration_method != MetricCalibrationMethod.NONE
+  )
+
+
 def save_calib_state(calib: CalibState, path: str) -> None:
   '''Persist a fitted CalibState for reuse across trap batches.'''
-  if not calib.ok or calib.piecewise_x is None or calib.piecewise_y is None:
+  if not calib.ok or not (_has_relative_calibration(calib) or _has_metric_calibration(calib)):
     return
 
   farthest_data = farthest_mask = None
@@ -106,13 +127,24 @@ def save_calib_state(calib: CalibState, path: str) -> None:
     path,
     ok=calib.ok,
     exp=calib.exp,
-    piecewise_x=calib.piecewise_x,
-    piecewise_y=calib.piecewise_y,
+    piecewise_x=np.asarray([] if calib.piecewise_x is None else calib.piecewise_x),
+    piecewise_y=np.asarray([] if calib.piecewise_y is None else calib.piecewise_y),
     farthest_data=farthest_data,
     farthest_mask=farthest_mask,
     farthest_raw_data=farthest_raw_data,
     farthest_raw_mask=farthest_raw_mask,
+    metric_pred_depths=np.asarray([] if calib.metric_pred_depths is None else calib.metric_pred_depths),
+    metric_true_depths=np.asarray([] if calib.metric_true_depths is None else calib.metric_true_depths),
+    metric_calibration_method=np.array(
+      '' if calib.metric_calibration_method is None else calib.metric_calibration_method.name
+    ),
   )
+
+
+def _rebuild_metric_correct(pred_depths, true_depths, method, exp):
+  if method is None or method == MetricCalibrationMethod.NONE or np.size(pred_depths) == 0:
+    return None
+  return calibrate_metric_model(pred_depths, true_depths, method, exp=exp)
 
 
 def load_calib_state(path: str, do_calibrate: Callable) -> CalibState:
@@ -126,13 +158,32 @@ def load_calib_state(path: str, do_calibrate: Callable) -> CalibState:
     farthest_mask = data['farthest_mask']
     farthest_raw_data = data['farthest_raw_data']
     farthest_raw_mask = data['farthest_raw_mask']
+    files = set(data.files)
+    if 'metric_pred_depths' in files and np.size(data['metric_pred_depths']) > 0:
+      metric_pred_depths = np.asarray(data['metric_pred_depths'])
+      metric_true_depths = np.asarray(data['metric_true_depths'])
+      method_name = str(np.array(data['metric_calibration_method']).item())
+      metric_method = MetricCalibrationMethod[method_name] if method_name else None
+    else:
+      metric_pred_depths = None
+      metric_true_depths = None
+      metric_method = None
 
-  calibration_map = _rebuild_calibration_map(exp, piecewise_x, piecewise_y)
-  farthest_calibration_frame_disp = np.ma.masked_array(farthest_data, farthest_mask)
-  farthest_calibration_frame_disp_raw = np.ma.masked_array(
-    farthest_raw_data,
-    farthest_raw_mask,
-  )
+  has_relative = piecewise_x is not None and np.size(piecewise_x) > 0
+  if has_relative:
+    calibration_map = _rebuild_calibration_map(exp, piecewise_x, piecewise_y)
+    farthest_calibration_frame_disp = np.ma.masked_array(farthest_data, farthest_mask)
+    farthest_calibration_frame_disp_raw = np.ma.masked_array(
+      farthest_raw_data,
+      farthest_raw_mask,
+    )
+  else:
+    calibration_map = None
+    farthest_calibration_frame_disp = None
+    farthest_calibration_frame_disp_raw = None
+    piecewise_x = None
+    piecewise_y = None
+
   return CalibState(
     calibration_map,
     farthest_calibration_frame_disp,
@@ -142,6 +193,12 @@ def load_calib_state(path: str, do_calibrate: Callable) -> CalibState:
     ok,
     piecewise_x=piecewise_x,
     piecewise_y=piecewise_y,
+    metric_pred_depths=metric_pred_depths,
+    metric_true_depths=metric_true_depths,
+    metric_calibration_method=metric_method,
+    metric_correct=_rebuild_metric_correct(
+      metric_pred_depths, metric_true_depths, metric_method, exp,
+    ),
   )
 
 
@@ -154,7 +211,8 @@ def traptagger_default_config() -> Config:
     num_workers=0,
     make_figures=False,
     detect_humans=False,
-    depth_estimation_model=DepthEstimationModel.DPT,
+    depth_estimation_model=DepthEstimationModel.UNIDEPTH_V2,
+    metric_calibration_method=MetricCalibrationMethod.PIECEWISE_LINEAR,
     detection_sampling_method=DetectionSamplingMethod.SAM,
     sample_from=SampleFrom.DETECTION,
   )
@@ -281,6 +339,9 @@ def _init_models(config: Config):
   elif config.depth_estimation_model == DepthEstimationModel.DEPTH_PRO:
     from depthpro import DepthPro
     depth_estimation_model = DepthPro()
+  elif config.depth_estimation_model == DepthEstimationModel.UNIDEPTH_V2:
+    from unidepthv2 import UniDepthv2
+    depth_estimation_model = UniDepthv2()
   else:
     raise ValueError('Invalid depth estimation model {}'.format(config.depth_estimation_model))
 
@@ -361,6 +422,141 @@ def _preprocess_calibration_masks_from_manifest(
     logging.info('Saved calibration mask from TrapTagger bbox for %s', filename)
 
 
+def _predict_metric_depths(depth_estimation_model, imgs):
+  '''Run a metric depth model on a batch. Fall back to one image at a time.'''
+  try:
+    out = depth_estimation_model(imgs)
+    if isinstance(out, list) and len(out) == len(imgs):
+      return out
+  except Exception:
+    logging.exception('Batched metric depth inference failed; retrying per image')
+  return [depth_estimation_model(img) for img in imgs]
+
+
+def _subject_mask_for_depth(mask_img, config: Config, depth_shape):
+  mask = crop(
+    mask_img > 127,
+    config.crop_top,
+    config.crop_bottom,
+    config.crop_left,
+    config.crop_right,
+  )
+  if mask.shape[0:2] != depth_shape[0:2]:
+    mask = resize(mask.astype(np.uint8) * 255, depth_shape) > 127
+  return mask
+
+
+def _known_calibration_distance(entry, transect_dir, calibration_frame_id):
+  if entry and entry.get('known_distance') is not None:
+    return float(entry['known_distance'])
+  return float(get_calibration_frame_dist(transect_dir, calibration_frame_id))
+
+
+def _calibrate_metric_transect(
+  transect_dir, transect_id, manifest, config, depth_estimation_model, sam,
+  do_calibrate, bbox_audit=None,
+) -> CalibState:
+  '''Fit one transect-level correction from known-distance calibration frames.'''
+  eps = 1e-6
+  exp = -1 if config.calibrate_metric else 1
+  _preprocess_calibration_masks_from_manifest(
+    transect_dir, manifest, config, sam, bbox_audit,
+  )
+
+  calibration_frame_filenames = sorted(list(set(
+    multi_file_extension_glob(
+      os.path.join(transect_dir, 'calibration_frames', '*'),
+      config.intensity_image_extensions,
+    )
+    + multi_file_extension_glob(
+      os.path.join(transect_dir, 'calibration_frames_cropped', '*'),
+      config.intensity_image_extensions,
+    )
+  )))
+  cal_entries = _calibration_entries_by_filename(manifest)
+  pred_by_dist = {}
+
+  if calibration_frame_filenames:
+    calibration_dataset = ImageDataset(
+      calibration_frame_filenames,
+      config.crop_top,
+      config.crop_bottom,
+      config.crop_left,
+      config.crop_right,
+    )
+    calibration_dataloader = DataLoader(
+      calibration_dataset,
+      batch_size=config.batch_size,
+      shuffle=False,
+      collate_fn=collate_fn,
+      num_workers=config.num_workers,
+    )
+    for imgs, image_paths in calibration_dataloader:
+      depths = _predict_metric_depths(depth_estimation_model, imgs)
+      for i, depth in enumerate(depths):
+        calibration_frame_id = os.path.splitext(os.path.basename(image_paths[i]))[0]
+        entry = cal_entries.get(os.path.basename(image_paths[i]))
+        try:
+          dist = _known_calibration_distance(entry, transect_dir, calibration_frame_id)
+        except Exception as e:
+          logging.warning(
+            'Skipping calibration frame %s in transect %s: %s',
+            calibration_frame_id, transect_id, exception_to_str(e),
+          )
+          continue
+        mask_path = get_extension_agnostic_path(
+          os.path.join(transect_dir, 'calibration_frames_masks', calibration_frame_id),
+          config.intensity_image_extensions,
+        )
+        mask_img = imread(mask_path, cv2.IMREAD_GRAYSCALE) if mask_path else None
+        if mask_img is None:
+          logging.warning(
+            'Missing calibration mask for %s in transect %s',
+            calibration_frame_id, transect_id,
+          )
+          continue
+        mask = _subject_mask_for_depth(mask_img, config, np.asarray(depth).shape)
+        subject_depths = np.asarray(depth)[mask]
+        subject_depths = subject_depths[np.isfinite(subject_depths) & (subject_depths > eps)]
+        if subject_depths.size == 0:
+          logging.warning(
+            'No predicted depth inside the subject mask for %s in transect %s',
+            calibration_frame_id, transect_id,
+          )
+          continue
+        pred_by_dist[dist] = float(np.median(subject_depths))
+
+  pred_by_dist = OrderedDict(sorted(pred_by_dist.items(), key=lambda kv: kv[0]))
+  if not pred_by_dist:
+    logging.warning('No usable metric calibration points for transect %s', transect_id)
+    return CalibState(None, None, None, exp, do_calibrate, False)
+
+  true_depths = np.array(list(pred_by_dist.keys()), dtype=np.float64)
+  pred_depths = np.array(list(pred_by_dist.values()), dtype=np.float64)
+  try:
+    metric_correct = calibrate_metric_model(
+      pred_depths,
+      true_depths,
+      config.metric_calibration_method,
+      exp=exp,
+      eps=eps,
+    )
+  except Exception as e:
+    logging.warning(
+      'Failed metric calibration of transect %s: %s',
+      transect_id, exception_to_str(e),
+    )
+    return CalibState(None, None, None, exp, do_calibrate, False)
+
+  return CalibState(
+    None, None, None, exp, do_calibrate, True,
+    metric_pred_depths=pred_depths,
+    metric_true_depths=true_depths,
+    metric_calibration_method=config.metric_calibration_method,
+    metric_correct=metric_correct,
+  )
+
+
 def _calibrate_transect(
   transect_dir: str,
   transect_id: str,
@@ -374,8 +570,13 @@ def _calibrate_transect(
   eps = 1e-6
   exp = -1 if config.calibrate_metric else 1
 
-  if config.depth_estimation_model == DepthEstimationModel.DEPTH_AHYTHING_METRIC:
-    return CalibState(None, None, None, exp, do_calibrate, True)
+  if config.depth_estimation_model in METRIC_DEPTH_ESTIMATION_MODELS:
+    if config.metric_calibration_method == MetricCalibrationMethod.NONE:
+      return CalibState(None, None, None, exp, do_calibrate, True)
+    return _calibrate_metric_transect(
+      transect_dir, transect_id, manifest, config, depth_estimation_model, sam,
+      do_calibrate, bbox_audit,
+    )
 
   _preprocess_calibration_masks_from_manifest(
     transect_dir, manifest, config, sam, bbox_audit,
@@ -577,11 +778,10 @@ def _compute_disps_for_images(
   exp = calib.exp
   do_calibrate = calib.do_calibrate
 
-  if config.depth_estimation_model in [
-    DepthEstimationModel.DEPTH_AHYTHING_METRIC,
-    DepthEstimationModel.DEPTH_PRO,
-  ]:
-    depths = depth_estimation_model(imgs)
+  if config.depth_estimation_model in METRIC_DEPTH_ESTIMATION_MODELS:
+    depths = _predict_metric_depths(depth_estimation_model, imgs)
+    if calib.metric_correct is not None:
+      depths = [calib.metric_correct(depth) for depth in depths]
     return [np.clip(depth, config.min_depth, config.max_depth) ** -1 for depth in depths]
 
   if calib.farthest_calibration_frame_disp is None or calib.calibration_map is None:
@@ -658,13 +858,19 @@ def _estimate_trap_detections(
   if not valid_entries:
     return results
 
-  if (
-    config.depth_estimation_model not in [
-      DepthEstimationModel.DEPTH_AHYTHING_METRIC,
-      DepthEstimationModel.DEPTH_PRO,
-    ]
-    and not calib.ok
-  ):
+  uses_metric_model = config.depth_estimation_model in METRIC_DEPTH_ESTIMATION_MODELS
+  needs_metric_calibration = (
+    uses_metric_model
+    and config.metric_calibration_method != MetricCalibrationMethod.NONE
+  )
+  if needs_metric_calibration and (not calib.ok or calib.metric_correct is None):
+    calibration_failed = True
+  elif (not uses_metric_model) and not calib.ok:
+    calibration_failed = True
+  else:
+    calibration_failed = False
+
+  if calibration_failed:
     for entry in valid_entries:
       results[str(entry['detection_id'])] = {
         'distance': None,

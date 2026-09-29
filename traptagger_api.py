@@ -108,6 +108,18 @@ def _has_metric_calibration(calib: CalibState) -> bool:
   )
 
 
+def _npz_array(value):
+  '''Store a missing frame as an empty numeric array.
+
+  np.savez turns None into an object array, and load_calib_state opens the
+  cache with allow_pickle=False. Metric calibration leaves the corrected
+  disparity frame unset, so those fields must not be None.
+  '''
+  if value is None:
+    return np.zeros(0, dtype=np.float32)
+  return value
+
+
 def save_calib_state(calib: CalibState, path: str) -> None:
   '''Persist a fitted CalibState for reuse across trap batches.'''
   if not calib.ok or not (_has_relative_calibration(calib) or _has_metric_calibration(calib)):
@@ -129,10 +141,10 @@ def save_calib_state(calib: CalibState, path: str) -> None:
     exp=calib.exp,
     piecewise_x=np.asarray([] if calib.piecewise_x is None else calib.piecewise_x),
     piecewise_y=np.asarray([] if calib.piecewise_y is None else calib.piecewise_y),
-    farthest_data=farthest_data,
-    farthest_mask=farthest_mask,
-    farthest_raw_data=farthest_raw_data,
-    farthest_raw_mask=farthest_raw_mask,
+    farthest_data=_npz_array(farthest_data),
+    farthest_mask=_npz_array(farthest_mask),
+    farthest_raw_data=_npz_array(farthest_raw_data),
+    farthest_raw_mask=_npz_array(farthest_raw_mask),
     metric_pred_depths=np.asarray([] if calib.metric_pred_depths is None else calib.metric_pred_depths),
     metric_true_depths=np.asarray([] if calib.metric_true_depths is None else calib.metric_true_depths),
     metric_calibration_method=np.array(

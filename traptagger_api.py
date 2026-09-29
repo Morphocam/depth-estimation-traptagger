@@ -179,8 +179,13 @@ def load_calib_state(path: str, do_calibrate: Callable) -> CalibState:
     )
   else:
     calibration_map = None
+    # Leave the corrected disparity frame unset so trap photos are not resized
+    # to the calibration frame. The raw reference is what metric alignment uses.
     farthest_calibration_frame_disp = None
-    farthest_calibration_frame_disp_raw = None
+    farthest_calibration_frame_disp_raw = _restore_masked_frame(
+      farthest_raw_data,
+      farthest_raw_mask,
+    )
     piecewise_x = None
     piecewise_y = None
 
@@ -452,6 +457,57 @@ def _known_calibration_distance(entry, transect_dir, calibration_frame_id):
   return float(get_calibration_frame_dist(transect_dir, calibration_frame_id))
 
 
+def _align_metric_depth(depth, exclude_mask, reference, do_calibrate, regression_method, exp, eps=1e-6):
+  '''
+  Line this metric depth map up with a reference calibration frame.
+
+  The fit uses background pixels only. exclude_mask marks the subject and is
+  left out of the fit, then the fitted scale and shift are applied to every
+  pixel. Alignment follows the DPT reference step: exp == 1 fits inverse depth.
+  Returns metric depth in metres.
+  '''
+  depth = np.clip(np.asarray(depth, dtype=np.float32), eps, np.inf)
+  ref_data = np.clip(np.asarray(np.ma.getdata(reference), dtype=np.float32), eps, np.inf)
+  ref_mask = np.ma.getmaskarray(reference)
+  if ref_mask.shape != ref_data.shape:
+    ref_mask = np.zeros(ref_data.shape[:2], dtype=bool)
+
+  depth_small = np.asarray(resize(depth, ref_data.shape), dtype=np.float32)
+  if exclude_mask is None:
+    exclude_small = np.zeros(ref_data.shape[:2], dtype=bool)
+  else:
+    exclude_u8 = (np.asarray(exclude_mask) > 0).astype(np.uint8) * 255
+    exclude_small = np.asarray(resize(exclude_u8, ref_data.shape)) > 127
+
+  src_masked = np.ma.masked_where(exclude_small | ref_mask, depth_small)
+  ref_masked = np.ma.masked_where(ref_mask, ref_data)
+  align = do_calibrate(
+    src_masked ** exp,
+    ref_masked ** exp,
+    regression_method,
+  )
+  aligned = np.clip(align(depth ** exp), eps, np.inf) ** exp
+  if exp == 1:
+    aligned = np.clip(aligned, eps, np.inf) ** -1
+  return aligned
+
+
+def _restore_masked_frame(data, mask):
+  '''Rebuild a masked calibration frame from arrays stored in an npz cache.'''
+  if data is None:
+    return None
+  arr = np.asarray(data)
+  if arr.dtype == object or arr.ndim < 2 or arr.size == 0:
+    return None
+  if mask is None:
+    mask_arr = np.zeros(arr.shape, dtype=bool)
+  else:
+    mask_arr = np.asarray(mask).astype(bool)
+    if mask_arr.shape != arr.shape:
+      mask_arr = np.zeros(arr.shape, dtype=bool)
+  return np.ma.masked_array(arr.astype(np.float32), mask_arr)
+
+
 def _calibrate_metric_transect(
   transect_dir, transect_id, manifest, config, depth_estimation_model, sam,
   do_calibrate, bbox_audit=None,
@@ -474,7 +530,7 @@ def _calibrate_metric_transect(
     )
   )))
   cal_entries = _calibration_entries_by_filename(manifest)
-  pred_by_dist = {}
+  frames = []
 
   if calibration_frame_filenames:
     calibration_dataset = ImageDataset(
@@ -516,15 +572,47 @@ def _calibrate_metric_transect(
           )
           continue
         mask = _subject_mask_for_depth(mask_img, config, np.asarray(depth).shape)
-        subject_depths = np.asarray(depth)[mask]
-        subject_depths = subject_depths[np.isfinite(subject_depths) & (subject_depths > eps)]
-        if subject_depths.size == 0:
+        if not np.any(mask):
           logging.warning(
             'No predicted depth inside the subject mask for %s in transect %s',
             calibration_frame_id, transect_id,
           )
           continue
-        pred_by_dist[dist] = float(np.median(subject_depths))
+        frames.append((dist, np.asarray(depth, dtype=np.float32), mask))
+
+  if not frames:
+    logging.warning('No usable metric calibration points for transect %s', transect_id)
+    return CalibState(None, None, None, exp, do_calibrate, False)
+
+  farthest_dist, farthest_depth, farthest_mask = max(frames, key=lambda item: item[0])
+  farthest_raw = np.ma.masked_where(farthest_mask, farthest_depth)
+  pred_by_dist = {}
+  for dist, depth, mask in frames:
+    try:
+      aligned = _align_metric_depth(
+        depth,
+        mask,
+        farthest_raw,
+        do_calibrate,
+        config.calibration_regression_method,
+        exp,
+        eps=eps,
+      )
+    except Exception as e:
+      logging.warning(
+        'Reference alignment failed for %.1fm calibration frame in transect %s: %s',
+        dist, transect_id, exception_to_str(e),
+      )
+      aligned = np.asarray(depth, dtype=np.float32)
+    subject_depths = np.asarray(aligned)[mask]
+    subject_depths = subject_depths[np.isfinite(subject_depths) & (subject_depths > eps)]
+    if subject_depths.size == 0:
+      logging.warning(
+        'No predicted depth inside the subject mask for %.1fm frame in transect %s',
+        dist, transect_id,
+      )
+      continue
+    pred_by_dist[dist] = float(np.median(subject_depths))
 
   pred_by_dist = OrderedDict(sorted(pred_by_dist.items(), key=lambda kv: kv[0]))
   if not pred_by_dist:
@@ -548,8 +636,12 @@ def _calibrate_metric_transect(
     )
     return CalibState(None, None, None, exp, do_calibrate, False)
 
+  logging.info(
+    'Metric reference frame for transect %s is the %.1fm calibration image',
+    transect_id, farthest_dist,
+  )
   return CalibState(
-    None, None, None, exp, do_calibrate, True,
+    None, None, farthest_raw, exp, do_calibrate, True,
     metric_pred_depths=pred_depths,
     metric_true_depths=true_depths,
     metric_calibration_method=config.metric_calibration_method,
@@ -780,6 +872,27 @@ def _compute_disps_for_images(
 
   if config.depth_estimation_model in METRIC_DEPTH_ESTIMATION_MODELS:
     depths = _predict_metric_depths(depth_estimation_model, imgs)
+    reference = calib.farthest_calibration_frame_disp_raw
+    if reference is not None:
+      aligned_depths = []
+      for depth, animal_mask in zip(depths, animal_masks):
+        try:
+          aligned_depths.append(_align_metric_depth(
+            depth,
+            animal_mask,
+            reference,
+            do_calibrate,
+            config.calibration_regression_method,
+            exp,
+            eps=eps,
+          ))
+        except Exception as e:
+          logging.warning(
+            'Reference alignment failed for a trap image: %s',
+            exception_to_str(e),
+          )
+          aligned_depths.append(depth)
+      depths = aligned_depths
     if calib.metric_correct is not None:
       depths = [calib.metric_correct(depth) for depth in depths]
     return [np.clip(depth, config.min_depth, config.max_depth) ** -1 for depth in depths]

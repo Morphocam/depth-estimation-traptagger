@@ -457,39 +457,53 @@ def _known_calibration_distance(entry, transect_dir, calibration_frame_id):
   return float(get_calibration_frame_dist(transect_dir, calibration_frame_id))
 
 
+def _metric_fit_space(metres, exp, eps):
+  '''
+  DPT aligns disparity. With exp == 1 that is inverse depth; with exp == -1 it
+  is metres. Metric maps are stored in metres, so convert into that same space.
+  '''
+  metres = np.clip(np.asarray(metres, dtype=np.float32), eps, np.inf)
+  if exp == 1:
+    return metres ** -1
+  return metres
+
+
+def _metres_from_fit_space(fitted, exp, eps):
+  '''Convert an aligned map back to metres.'''
+  fitted = np.clip(np.asarray(fitted, dtype=np.float32), eps, np.inf)
+  if exp == 1:
+    return fitted ** -1
+  return fitted
+
+
 def _align_metric_depth(depth, exclude_mask, reference, do_calibrate, regression_method, exp, eps=1e-6):
   '''
   Line this metric depth map up with a reference calibration frame.
 
   The fit uses background pixels only. exclude_mask marks the subject and is
   left out of the fit, then the fitted scale and shift are applied to every
-  pixel. Alignment follows the DPT reference step: exp == 1 fits inverse depth.
-  Returns metric depth in metres.
+  pixel. Returns metric depth in metres.
   '''
-  depth = np.clip(np.asarray(depth, dtype=np.float32), eps, np.inf)
   ref_data = np.clip(np.asarray(np.ma.getdata(reference), dtype=np.float32), eps, np.inf)
   ref_mask = np.ma.getmaskarray(reference)
   if ref_mask.shape != ref_data.shape:
     ref_mask = np.zeros(ref_data.shape[:2], dtype=bool)
 
-  depth_small = np.asarray(resize(depth, ref_data.shape), dtype=np.float32)
+  depth_m = np.clip(np.asarray(depth, dtype=np.float32), eps, np.inf)
+  depth_small = np.asarray(resize(depth_m, ref_data.shape), dtype=np.float32)
   if exclude_mask is None:
     exclude_small = np.zeros(ref_data.shape[:2], dtype=bool)
   else:
     exclude_u8 = (np.asarray(exclude_mask) > 0).astype(np.uint8) * 255
     exclude_small = np.asarray(resize(exclude_u8, ref_data.shape)) > 127
 
-  src_masked = np.ma.masked_where(exclude_small | ref_mask, depth_small)
-  ref_masked = np.ma.masked_where(ref_mask, ref_data)
-  align = do_calibrate(
-    src_masked ** exp,
-    ref_masked ** exp,
-    regression_method,
-  )
-  aligned = np.clip(align(depth ** exp), eps, np.inf) ** exp
-  if exp == 1:
-    aligned = np.clip(aligned, eps, np.inf) ** -1
-  return aligned
+  src_fit = _metric_fit_space(depth_small, exp, eps)
+  ref_fit = _metric_fit_space(ref_data, exp, eps)
+  src_masked = np.ma.masked_where(exclude_small | ref_mask, src_fit)
+  ref_masked = np.ma.masked_where(ref_mask, ref_fit)
+  align = do_calibrate(src_masked, ref_masked, regression_method)
+  aligned_fit = align(_metric_fit_space(depth_m, exp, eps))
+  return _metres_from_fit_space(aligned_fit, exp, eps)
 
 
 def _restore_masked_frame(data, mask):

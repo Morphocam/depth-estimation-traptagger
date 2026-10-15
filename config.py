@@ -45,6 +45,8 @@ class Config:
     calibration_mask_animals: bool = False  # whether to mask animals during calibration
     calibrate_blur: bool = False  # whether to blur depth images during calibration
     metric_calibration_method: MetricCalibrationMethod = MetricCalibrationMethod.NONE  # correction applied to metric depth models (DEPTH_AHYTHING_METRIC|DEPTH_PRO|UNIDEPTH_V2). one of NONE|SCALE|AFFINE|PIECEWISE_LINEAR
+    register_to_reference: bool = False  # register each detection frame to the reference calibration frame (homography) before aligning depth maps. Compensates cameras re-aimed after calibration and mixed 4:3/16:9 capture modes. Only used by traptagger_api.
+    mask_info_bar: bool = False  # exclude the dark camera info strip at the bottom of frames from depth alignment. Only used by traptagger_api.
 
     # sampling_parameters
     detection_sampling_method: DetectionSamplingMethod = DetectionSamplingMethod.BBOX_PERCENTILE  # one of BBOX_BOTTOM|BBOX_PERCENTILE|SAM

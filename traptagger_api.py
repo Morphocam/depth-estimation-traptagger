@@ -38,6 +38,7 @@ from utils import (
     piecewise_linear_calibration,
     resize,
 )
+from registration import ImageRegistration, info_bar_mask, warp_to_reference
 
 from torch.utils.data import DataLoader, Dataset
 
@@ -83,6 +84,13 @@ class CalibState:
   metric_true_depths: Optional[np.ndarray] = None
   metric_calibration_method: Optional[MetricCalibrationMethod] = None
   metric_correct: Optional[Callable] = None
+  # reference calibration image (after crop) and the pixels of it that must not
+  # take part in depth alignment (calibration subject, info strip)
+  reference_image: Optional[np.ndarray] = None
+  reference_ignore: Optional[np.ndarray] = None
+  # reference pixels at or beyond max_depth (sky), excluded from alignment
+  reference_far_mask: Optional[np.ndarray] = None
+  registration: Optional[ImageRegistration] = None
 
 
 def _rebuild_calibration_map(exp, piecewise_x, piecewise_y):
@@ -150,6 +158,8 @@ def save_calib_state(calib: CalibState, path: str) -> None:
     metric_calibration_method=np.array(
       '' if calib.metric_calibration_method is None else calib.metric_calibration_method.name
     ),
+    reference_image=_npz_array(calib.reference_image),
+    reference_ignore=_npz_array(calib.reference_ignore),
   )
 
 
@@ -180,6 +190,11 @@ def load_calib_state(path: str, do_calibrate: Callable) -> CalibState:
       metric_pred_depths = None
       metric_true_depths = None
       metric_method = None
+    reference_image = None
+    reference_ignore = None
+    if 'reference_image' in files and np.size(data['reference_image']) > 0:
+      reference_image = np.asarray(data['reference_image'], dtype=np.uint8)
+      reference_ignore = np.asarray(data['reference_ignore']).astype(bool)
 
   has_relative = piecewise_x is not None and np.size(piecewise_x) > 0
   if has_relative:
@@ -216,6 +231,8 @@ def load_calib_state(path: str, do_calibrate: Callable) -> CalibState:
     metric_correct=_rebuild_metric_correct(
       metric_pred_depths, metric_true_depths, metric_method, exp,
     ),
+    reference_image=reference_image,
+    reference_ignore=reference_ignore,
   )
 
 
@@ -228,10 +245,13 @@ def traptagger_default_config() -> Config:
     num_workers=0,
     make_figures=False,
     detect_humans=False,
-    depth_estimation_model=DepthEstimationModel.UNIDEPTH_V2,
+    depth_estimation_model=DepthEstimationModel.UNIDEPTH_V2_LARGE,
     metric_calibration_method=MetricCalibrationMethod.PIECEWISE_LINEAR,
     detection_sampling_method=DetectionSamplingMethod.SAM,
     sample_from=SampleFrom.DETECTION,
+    register_to_reference=True,
+    mask_info_bar=True,
+    calibration_mask_animals=True,
   )
 
 
@@ -359,6 +379,9 @@ def _init_models(config: Config):
   elif config.depth_estimation_model == DepthEstimationModel.UNIDEPTH_V2:
     from unidepthv2 import UniDepthv2
     depth_estimation_model = UniDepthv2()
+  elif config.depth_estimation_model == DepthEstimationModel.UNIDEPTH_V2_LARGE:
+    from unidepthv2_large import UniDepthv2Large
+    depth_estimation_model = UniDepthv2Large()
   else:
     raise ValueError('Invalid depth estimation model {}'.format(config.depth_estimation_model))
 
@@ -534,6 +557,87 @@ def _restore_masked_frame(data, mask):
   return np.ma.masked_array(arr.astype(np.float32), mask_arr)
 
 
+def _ignore_mask(img, subject_mask, config: Config) -> np.ndarray:
+  '''Pixels of a frame excluded from depth alignment: the subject and, optionally, the info strip.'''
+  if subject_mask is None:
+    ignore = np.zeros(img.shape[0:2], dtype=bool)
+  else:
+    ignore = np.asarray(subject_mask, dtype=bool)
+    if ignore.shape != img.shape[0:2]:
+      ignore = resize(ignore.astype(np.uint8) * 255, img.shape[0:2]) > 127
+  if config.mask_info_bar:
+    ignore = ignore | info_bar_mask(img)
+  return ignore
+
+
+def _register(calib: CalibState, img, config: Config):
+  '''Homography from img to the reference calibration frame, or None.'''
+  if not config.register_to_reference or calib.reference_image is None:
+    return None
+  if calib.registration is None:
+    calib.registration = ImageRegistration(calib.reference_image)
+  H = calib.registration(img)
+  if H is None:
+    logging.info('Could not register a frame to the reference calibration frame; assuming the camera did not move')
+  return H
+
+
+def _reference_far_mask(calib: CalibState, config: Config, eps=1e-6) -> Optional[np.ndarray]:
+  '''Reference pixels at or beyond max_depth after calibration (sky, far background).'''
+  if calib.reference_far_mask is not None:
+    return calib.reference_far_mask
+  if calib.farthest_calibration_frame_disp is not None:
+    disp = np.clip(np.asarray(np.ma.getdata(calib.farthest_calibration_frame_disp), dtype=np.float64), eps, np.inf)
+    far = disp ** -1 >= config.max_depth - eps
+  elif calib.farthest_calibration_frame_disp_raw is not None:
+    depth = np.asarray(np.ma.getdata(calib.farthest_calibration_frame_disp_raw), dtype=np.float64)
+    if calib.metric_correct is not None:
+      depth = calib.metric_correct(depth)
+    far = depth >= config.max_depth - eps
+  else:
+    return None
+  calib.reference_far_mask = far
+  return far
+
+
+def _fit_to_reference(src_fit, img, subject_mask, ref_fit, calib: CalibState, config: Config, do_calibrate):
+  '''
+  Fit the per-image scale and shift mapping src_fit onto the reference frame.
+
+  src_fit is a depth or disparity map of img in its own pixel coordinates.
+  The frame is registered to the reference calibration frame and warped into
+  its coordinates so that the regression compares the same scene points even
+  if the camera moved after calibration. Without a registration the map is
+  resized onto the reference, as before. Returns the fitted callable, which is
+  applied to maps in img's own coordinates.
+  '''
+  ref_data = np.asarray(np.ma.getdata(ref_fit), dtype=np.float32)
+  ref_shape = ref_data.shape[0:2]
+  src_fit = np.asarray(src_fit, dtype=np.float32)
+  ignore = _ignore_mask(img, subject_mask, config).astype(np.uint8)
+
+  H = _register(calib, img, config)
+  if H is not None:
+    src_ref = warp_to_reference(src_fit, H, ref_shape)
+    ignore_ref = warp_to_reference(ignore, H, ref_shape, nearest=True, border_value=1) > 0
+  else:
+    src_ref = np.asarray(resize(src_fit, ref_shape), dtype=np.float32)
+    ignore_ref = resize(ignore * 255, ref_shape) > 127
+
+  valid = ~ignore_ref & ~np.ma.getmaskarray(ref_fit) & np.isfinite(src_ref) & np.isfinite(ref_data)
+  if calib.reference_ignore is not None and calib.reference_ignore.shape == ref_shape:
+    valid &= ~calib.reference_ignore
+  far = _reference_far_mask(calib, config)
+  if far is not None and far.shape == ref_shape:
+    valid &= ~far
+
+  return do_calibrate(
+    np.ma.masked_where(~valid, src_ref),
+    np.ma.masked_where(~valid, ref_data),
+    config.calibration_regression_method,
+  )
+
+
 def _calibrate_metric_transect(
   transect_dir, transect_id, manifest, config, depth_estimation_model, sam,
   do_calibrate, bbox_audit=None,
@@ -604,20 +708,20 @@ def _calibrate_metric_transect(
             calibration_frame_id, transect_id,
           )
           continue
-        frames.append((dist, np.asarray(depth, dtype=np.float32), mask))
+        frames.append((dist, np.asarray(depth, dtype=np.float32), mask, imgs[i]))
 
   if not frames:
     logging.warning('No usable metric calibration points for transect %s', transect_id)
     return CalibState(None, None, None, exp, do_calibrate, False)
 
-  farthest_dist, farthest_depth, farthest_mask = max(frames, key=lambda item: item[0])
+  farthest_dist, farthest_depth, farthest_mask, farthest_img = max(frames, key=lambda item: item[0])
   farthest_raw = np.ma.masked_where(farthest_mask, farthest_depth)
   pred_by_dist = {}
-  for dist, depth, mask in frames:
+  for dist, depth, mask, img in frames:
     try:
       aligned = _align_metric_depth(
         depth,
-        mask,
+        _ignore_mask(img, mask, config),
         farthest_raw,
         do_calibrate,
         config.calibration_regression_method,
@@ -672,6 +776,8 @@ def _calibrate_metric_transect(
     metric_true_depths=true_depths,
     metric_calibration_method=config.metric_calibration_method,
     metric_correct=metric_correct,
+    reference_image=farthest_img,
+    reference_ignore=_ignore_mask(farthest_img, farthest_mask, config),
   )
 
 
@@ -701,6 +807,7 @@ def _calibrate_transect(
   )
 
   calibration_frames = {}
+  calibration_images = {}
   farthest_calibration_frame_disp_raw = None
   calibration_map = None
   farthest_calibration_frame_disp = None
@@ -765,6 +872,7 @@ def _calibrate_transect(
         )
         disp = np.ma.masked_where(mask, disp)
         calibration_frames[dist] = disp
+        calibration_images[dist] = imgs[i]
 
   calibration_frames = OrderedDict(sorted(calibration_frames.items(), key=lambda kv: kv[0]))
   farthest_calibration_frame_disp_raw = (
@@ -775,14 +883,23 @@ def _calibrate_transect(
     return CalibState(None, None, None, exp, do_calibrate, False)
 
   try:
+    reference_shape = farthest_calibration_frame_disp_raw.shape
+    reference_img = calibration_images[list(calibration_frames.keys())[-1]]
+    reference_ignore = _ignore_mask(reference_img, farthest_calibration_frame_disp_raw.mask, config)
     x, y = [], []
     for dist, disp in calibration_frames.items():
-      disp = resize(disp, farthest_calibration_frame_disp_raw.shape)
+      disp = resize(disp, reference_shape)
       if config.calibrate_metric:
         disp = np.clip(disp, eps, np.inf)
+      fit_src = disp ** exp
+      fit_ref = farthest_calibration_frame_disp_raw ** exp
+      if config.mask_info_bar:
+        bar = resize(info_bar_mask(calibration_images[dist]).astype(np.uint8) * 255, reference_shape) > 127
+        fit_src = np.ma.masked_where(np.ma.getmaskarray(fit_src) | bar, fit_src)
+        fit_ref = np.ma.masked_where(reference_ignore, fit_ref)
       disp_calibrated = do_calibrate(
-        disp ** exp,
-        farthest_calibration_frame_disp_raw ** exp,
+        fit_src,
+        fit_ref,
         config.calibration_regression_method,
       )(disp.data ** exp) ** exp
       disp_calibrated = np.ma.masked_where(disp.mask, disp_calibrated)
@@ -814,6 +931,8 @@ def _calibrate_transect(
       True,
       piecewise_x=piecewise_x,
       piecewise_y=piecewise_y,
+      reference_image=reference_img,
+      reference_ignore=reference_ignore,
     )
   except Exception as e:
     logging.warning(
@@ -901,8 +1020,19 @@ def _compute_disps_for_images(
     reference = calib.farthest_calibration_frame_disp_raw
     if reference is not None:
       aligned_depths = []
-      for depth, animal_mask in zip(depths, animal_masks):
+      for img, depth, animal_mask in zip(imgs, depths, animal_masks):
         try:
+          if config.register_to_reference:
+            reference_fit = np.ma.masked_array(
+              _metric_fit_space(np.ma.getdata(reference), exp, eps),
+              np.ma.getmaskarray(reference),
+            )
+            depth_fit = _metric_fit_space(depth, exp, eps)
+            align = _fit_to_reference(
+              depth_fit, img, animal_mask, reference_fit, calib, config, do_calibrate,
+            )
+            aligned_depths.append(_metres_from_fit_space(align(depth_fit), exp, eps))
+            continue
           aligned_depths.append(_align_metric_depth(
             depth,
             animal_mask,
@@ -931,6 +1061,27 @@ def _compute_disps_for_images(
   for i, disp in enumerate(computed_disps):
     if config.calibrate_metric:
       disp = np.clip(disp, eps, np.inf)
+
+    if config.register_to_reference:
+      reference_fit = np.ma.masked_array(
+        np.ma.getdata(calib.farthest_calibration_frame_disp_raw) ** exp,
+        np.ma.getmaskarray(calib.farthest_calibration_frame_disp_raw),
+      )
+      try:
+        align = _fit_to_reference(
+          disp ** exp,
+          imgs[i],
+          animal_masks[i] if config.calibration_mask_animals else None,
+          reference_fit,
+          calib,
+          config,
+          do_calibrate,
+        )
+      except Exception as e:
+        logging.warning('Reference alignment failed for a trap image: %s', exception_to_str(e))
+        continue
+      disps[i] = calib.calibration_map(align(disp ** exp) ** exp)
+      continue
 
     mask = (calib.farthest_calibration_frame_disp ** -1) >= (config.max_depth - eps)
     if config.calibration_mask_animals:
@@ -1024,9 +1175,12 @@ def _estimate_trap_detections(
         })
     return results
 
+  # Registered frames are processed at their own size and aspect ratio. Only
+  # the legacy pixel-to-pixel alignment stretches them onto the reference.
   resize_shape = (
     calib.farthest_calibration_frame_disp.shape
     if calib.farthest_calibration_frame_disp is not None
+    and (not config.register_to_reference or config.sample_from == SampleFrom.REFERENCE)
     else None
   )
 
@@ -1260,6 +1414,7 @@ def prepare_transect_session(
     resize_shape = (
       list(calib.farthest_calibration_frame_disp.shape)
       if calib.farthest_calibration_frame_disp is not None
+      and (not config.register_to_reference or config.sample_from == SampleFrom.REFERENCE)
       else None
     )
     bbox_audit['job_config']['resize_shape'] = resize_shape
@@ -1321,6 +1476,8 @@ def release_transect_session(session: Optional[dict]) -> None:
       logging.warning('Failed to close depth model %s: %s', key, e)
     del model
 
-  session.pop('calib', None)
+  calib = session.pop('calib', None)
+  if calib is not None and calib.registration is not None:
+    calib.registration.close()
   session.clear()
   free_gpu_memory()

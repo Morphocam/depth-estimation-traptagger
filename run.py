@@ -97,6 +97,9 @@ def run(config: Config, gui=False):
         depth_estimation_model = DepthPro()
     elif config.depth_estimation_model == DepthEstimationModel.UNIDEPTH_V2:
         depth_estimation_model = UniDepthv2()
+    elif config.depth_estimation_model == DepthEstimationModel.UNIDEPTH_V2_LARGE:
+        from unidepthv2_large import UniDepthv2Large
+        depth_estimation_model = UniDepthv2Large()
     else:
         raise ValueError(f"Invalud depth estimation model '{config.depth_estimation_model}'")
 

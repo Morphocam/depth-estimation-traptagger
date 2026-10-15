@@ -42,6 +42,7 @@ class DepthEstimationModel(Enum):
     MONODEPTH2 = auto()
     DEPTH_PRO = auto()
     UNIDEPTH_V2 = auto()
+    UNIDEPTH_V2_LARGE = auto()
 
 
 # Models whose raw output is already in metric units and which therefore do not
@@ -52,6 +53,7 @@ METRIC_DEPTH_ESTIMATION_MODELS = frozenset({
     DepthEstimationModel.DEPTH_AHYTHING_METRIC,
     DepthEstimationModel.DEPTH_PRO,
     DepthEstimationModel.UNIDEPTH_V2,
+    DepthEstimationModel.UNIDEPTH_V2_LARGE,
 })
 
 

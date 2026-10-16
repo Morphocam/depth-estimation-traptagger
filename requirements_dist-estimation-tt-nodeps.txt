@@ -1,0 +1,4 @@
+# Installed with --no-deps: UniDepth pins numpy>=2 / older torch, which the rest of the
+# pipeline does not support. Do NOT install xformers: its flash-attention kernels fail on
+# Blackwell GPUs and UniDepth falls back to PyTorch attention without it.
+unidepth @ git+https://github.com/lpiccinelli-eth/UniDepth.git

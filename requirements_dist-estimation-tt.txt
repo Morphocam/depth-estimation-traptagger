@@ -1,0 +1,25 @@
+# Environment "dist-estimation-tt" (Python 3.10). Create with:
+#   conda create -n dist-estimation-tt python=3.10
+#   pip install -r requirements_dist-estimation-tt.txt
+#   pip install --no-deps -r requirements_dist-estimation-tt-nodeps.txt
+# Blackwell GPUs (sm_120) need the CUDA 12.8 PyTorch build.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1
+torchvision==0.22.1
+numpy<2.0.0
+onnxruntime-gpu==1.22.0
+opencv-python-headless
+scikit-learn
+scipy
+matplotlib
+tqdm
+platformdirs
+timm
+einops
+pandas
+openpyxl
+transformers>=4.48
+accelerate
+huggingface_hub
+safetensors
+kornia==0.8.1

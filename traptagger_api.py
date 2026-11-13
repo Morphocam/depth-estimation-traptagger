@@ -320,6 +320,37 @@ def _cropped_image_shape(img_shape, config: Config):
   )
 
 
+def _mask_in_original_image(mask, orig_shape, config: Config, resize_shape=None):
+  '''Map a SAM mask from the crop/resize space back onto the original image.
+
+  Returns a boolean array of shape (orig_height, orig_width), or None.
+  '''
+  if mask is None or orig_shape is None:
+    return None
+  mask = np.squeeze(np.asarray(mask))
+  if mask.ndim != 2:
+    return None
+  mask = mask.astype(bool)
+  cropped_h, cropped_w = _cropped_image_shape(orig_shape, config)
+  if cropped_h <= 0 or cropped_w <= 0:
+    return None
+  if resize_shape is not None and (mask.shape[0] != cropped_h or mask.shape[1] != cropped_w):
+    mask = cv2.resize(
+      mask.astype(np.uint8),
+      (int(cropped_w), int(cropped_h)),
+      interpolation=cv2.INTER_NEAREST,
+    ).astype(bool)
+  full = np.zeros((int(orig_shape[0]), int(orig_shape[1])), dtype=bool)
+  y0 = int(config.crop_top)
+  x0 = int(config.crop_left)
+  y1 = min(full.shape[0], y0 + mask.shape[0])
+  x1 = min(full.shape[1], x0 + mask.shape[1])
+  if y1 <= y0 or x1 <= x0:
+    return None
+  full[y0:y1, x0:x1] = mask[:y1 - y0, :x1 - x0]
+  return full
+
+
 def _transform_box_for_preprocessing(box, img_shape, config: Config, resize_shape=None) -> np.ndarray:
   '''
   Map bbox_pixels in original image coordinates to the crop+resize space used by
@@ -1307,6 +1338,9 @@ def _estimate_trap_detections(
           sampled_depth = _sample_depth_at_box(depth, box, mask, config)
           trap_audit['distance'] = round(float(sampled_depth), 4)
           results[det_id] = {'distance': trap_audit['distance'], 'error': None}
+          original_mask = _mask_in_original_image(mask, orig_img.shape if orig_img is not None else None, config, resize_shape)
+          if original_mask is not None:
+            results[det_id]['_mask'] = original_mask
         except Exception as e:
           logging.exception('Trap detection %s failed', det_id)
           trap_audit['error'] = str(e)

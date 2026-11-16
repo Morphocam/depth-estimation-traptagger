@@ -2,9 +2,8 @@
 #   conda create -n dist-estimation-tt python=3.10
 #   pip install -r requirements_dist-estimation-tt.txt
 #   pip install --no-deps -r requirements_dist-estimation-tt-nodeps.txt
-# Blackwell GPUs (sm_120) need the CUDA 12.8 PyTorch build.
+# Torch and onnxruntime-gpu are installed by depthworker/requirements_inference.txt.
 numpy<2.0.0
-onnxruntime-gpu==1.22.0
 opencv-python-headless
 scikit-learn
 scipy

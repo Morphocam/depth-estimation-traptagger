@@ -1466,6 +1466,45 @@ def prepare_transect_session(
   }
 
 
+def masks_for_entries(session: dict, entries) -> Dict[str, object]:
+  '''SAM masks in original-image coordinates, without running depth.
+
+  Used when a detection already has a distance but still needs a shoulder height.
+  '''
+  config = session['config']
+  sam = session['sam']
+  transect_dir = session['transect_dir']
+  masks = {}
+  for entry in entries:
+    det_id = str(entry['detection_id'])
+    image_path = os.path.join(transect_dir, entry.get('relative_path') or '')
+    img = imread(image_path)
+    if img is None or 'bbox_pixels' not in entry:
+      masks[det_id] = None
+      continue
+    cropped = crop(
+      img,
+      config.crop_top,
+      config.crop_bottom,
+      config.crop_left,
+      config.crop_right,
+    )
+    box = _transform_box_for_preprocessing(
+      _clip_box_to_image(_box_from_pixels(entry['bbox_pixels']), img.shape),
+      img.shape,
+      config,
+      None,
+    )
+    box = _clip_box_to_image(box, cropped.shape)
+    if box[2] <= box[0] or box[3] <= box[1]:
+      masks[det_id] = None
+      continue
+    sam_result = sam([cropped], [[box]])
+    raw_mask = sam_result[0][0] if sam_result else None
+    masks[det_id] = _mask_in_original_image(raw_mask, img.shape, config, None)
+  return masks
+
+
 def estimate_transect_traps(session: dict) -> dict:
   '''
   Estimate distances for trap detections currently listed in the transect
